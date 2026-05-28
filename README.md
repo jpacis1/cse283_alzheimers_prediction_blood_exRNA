@@ -87,3 +87,8 @@ All outputs are written to the directory specified by `--output_dir` (default is
 
 ## Conda environment
 I can attach a yml file for my conda environment that I used to run the pipeline, but I made my own conda environment to run this pipeline and installed the necessary packages
+
+Once I made the environment, I think this is all that is needed to be installed to run the classifier pipeline.
+```
+mamba install numpy pandas matplotlib seaborn scipy scikit-learn -c conda-forge
+```
