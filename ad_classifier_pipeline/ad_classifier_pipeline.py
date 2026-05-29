@@ -179,7 +179,7 @@ def filter_low_counts(counts: pd.DataFrame,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 4.  Normalisation
+# 4.  Normalization
 # ═══════════════════════════════════════════════════════════════════════════
 
 def normalize_cpm_log2(counts: pd.DataFrame,
@@ -365,7 +365,7 @@ def encode_covariates(meta: pd.DataFrame) -> pd.DataFrame:
         cov["age"] = pd.to_numeric(meta["age"], errors="coerce")
         cov["age"] = cov["age"].fillna(cov["age"].mean())
 
-    # Year of sample collection (useful proxy when age is missing)
+    # Year of sample collection (useful proxy when age is missing) #######LOOK AT THIS, THIS MAY NOT BE A GOOD IDEA
     if "year_sample" in meta.columns:
         cov["year_sample"] = pd.to_numeric(meta["year_sample"], errors="coerce")
         cov["year_sample"] = cov["year_sample"].fillna(cov["year_sample"].mean())
@@ -531,7 +531,7 @@ def leave_donor_out_cv(X: pd.DataFrame,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 9.  Visualisation
+# 9.  Visualization
 # ═══════════════════════════════════════════════════════════════════════════
 
 PALETTE = {"AD": "#D85A30", "N": "#1D9E75"}

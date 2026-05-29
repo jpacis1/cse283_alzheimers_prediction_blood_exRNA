@@ -53,7 +53,7 @@ python ad_classifier_pipeline.py \
     --classifier logistic
 ```
 
-## ⚙️ Pipeline Execution Steps
+## Pipeline Execution Steps
 
 1. **GWAS Parsing:** Reads your CSV with `header=1` (skipping the table title row), then auto-detects the gene column by searching for "gene" in the header. Multi-gene cells (e.g., `HLA-DRB1/HLA-DRB5` or `MS4A6A/MS4A4E`) are automatically split on `/` and `,`.
 2. **Low-Count Filter:** Removes genes with fewer than 10 reads in at least 10% of samples ($\approx$ 12 samples here). This filters the matrix down from 60,675 to **~22,150 genes** before normalization—a standard practice to eliminate background noise from very sparse genes.
