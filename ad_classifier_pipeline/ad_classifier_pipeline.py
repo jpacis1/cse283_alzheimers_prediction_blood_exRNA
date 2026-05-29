@@ -74,40 +74,21 @@ log = logging.getLogger(__name__)
 
 def load_gwas_genes(gwas_csv: str) -> set:
     """
-    Parse the ADSP GVC-style GWAS table and return a set of gene symbols.
-
-    The table has a two-row header (rows 0 and 1 are metadata/column names),
-    so we read with header=1 to use row index 1 as the column header.
-    We then find the column that contains gene names (header includes "gene"),
-    split cells on "/" or "," (some cells list multiple genes), strip
-    whitespace, and return the unique non-empty symbols.
+    Read a pre-wrangled GWAS CSV with a 'gene_symbol' column
+    (output of load_gwas_combined).
     """
     log.info(f"Loading GWAS gene list from: {gwas_csv}")
-    df = pd.read_csv(gwas_csv, header=1)          # row 1 becomes the header
-    log.info(f"  GWAS table shape after header parse: {df.shape}")
-    log.info(f"  Columns: {df.columns.tolist()}")
-
-    # Find the gene column (flexible matching)
-    gene_col = None
-    for col in df.columns:
-        if "gene" in str(col).lower():
-            gene_col = col
-            break
-    if gene_col is None:
+    df = pd.read_csv(gwas_csv)
+    
+    if "gene_symbol" not in df.columns:
         raise ValueError(
-            "Could not find a gene column in the GWAS CSV. "
-            f"Available columns: {df.columns.tolist()}"
+            f"Expected a 'gene_symbol' column but found: {df.columns.tolist()}\n"
+            "Make sure you're passing the wrangled output CSV, not the raw ADSP file."
         )
-    log.info(f"  Using gene column: '{gene_col}'")
-
-    genes = set()
-    for raw in df[gene_col].dropna():
-        for part in str(raw).replace(",", "/").split("/"):
-            symbol = part.strip()
-            if symbol:
-                genes.add(symbol)
-
-    log.info(f"  Parsed {len(genes)} unique GWAS gene symbols")
+    
+    genes = set(df["gene_symbol"].dropna().str.strip())
+    genes.discard("")
+    log.info(f"  Loaded {len(genes)} unique GWAS gene symbols")
     return genes
 
 
@@ -330,50 +311,33 @@ def gwas_filter_expression(norm_expr: pd.DataFrame,
 
 def encode_covariates(meta: pd.DataFrame) -> pd.DataFrame:
     """
-    Encode available clinical covariates as numeric features.
-
-    Features encoded (when present in metadata):
-    - apoe_carrier   : binary (1 = apoe4 carrier, 0 = not)
-    - apoe_dose      : ordinal (0 = no_apoe4, 1 = one copy, 2 = two copies)
-    - sex            : binary (1 = male, 0 = female) — if column exists
-    - age            : numeric — if column exists
-    - year_sample    : numeric (collection year; proxy for age if age absent)
-    - braak_stage    : ordinal integer (included as covariate, not target)
-
-    All columns are returned as float32. Missing values are mean-imputed.
+    Encode clinical covariates. Braak stage is EXCLUDED — it is a 
+    post-mortem neuropathological measure that directly defines the 
+    AD/N label and would constitute target leakage.
     """
     cov = pd.DataFrame(index=meta.index)
 
-    # ApoE carrier (binary)
     if "apoe_carrier" in meta.columns:
         cov["apoe4_carrier"] = (meta["apoe_carrier"] == "apoe4").astype(float)
 
-    # ApoE dose (0 / 1 / 2 copies)
     if "apoe_dose" in meta.columns:
         dose_map = {"no_apoe4": 0, "apoe4": 1, "apoe44": 2}
         cov["apoe4_dose"] = meta["apoe_dose"].map(dose_map).fillna(0).astype(float)
 
-    # Sex (if available)
     if "sex" in meta.columns:
-        sex_map = {"M": 1, "male": 1, "F": 0, "female": 0}
         cov["sex_male"] = meta["sex"].str.lower().map(
             {"m": 1, "male": 1, "f": 0, "female": 0}
         ).fillna(0).astype(float)
 
-    # Age (if available)
     if "age" in meta.columns:
         cov["age"] = pd.to_numeric(meta["age"], errors="coerce")
         cov["age"] = cov["age"].fillna(cov["age"].mean())
 
-    # Year of sample collection (useful proxy when age is missing) #######LOOK AT THIS, THIS MAY NOT BE A GOOD IDEA
     if "year_sample" in meta.columns:
         cov["year_sample"] = pd.to_numeric(meta["year_sample"], errors="coerce")
         cov["year_sample"] = cov["year_sample"].fillna(cov["year_sample"].mean())
 
-    # Braak stage as covariate (not the label — it's correlated but distinct)
-    if "braak_stage" in meta.columns:
-        cov["braak_stage"] = pd.to_numeric(meta["braak_stage"], errors="coerce")
-        cov["braak_stage"] = cov["braak_stage"].fillna(cov["braak_stage"].median())
+    # braak_stage intentionally excluded — direct proxy for the label
 
     log.info(f"  Encoded covariates: {cov.columns.tolist()}")
     return cov.astype("float32")
@@ -435,37 +399,28 @@ def make_classifier(name: str, seed: int = 42):
     return Pipeline([("scaler", StandardScaler()), ("clf", clf)])
 
 
-def leave_donor_out_cv(X: pd.DataFrame,
-                       y: pd.Series,
-                       groups: pd.Series,
-                       classifier_name: str = "logistic",
-                       seed: int = 42):
+def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_test_donors=2):
     """
-    Leave-one-donor-out cross-validation.
-
-    Because samples from the same donor are correlated (longitudinal design),
-    we must ensure all samples from a given donor are either entirely in the
-    training set or entirely in the test set — never split across folds.
-
-    Uses StratifiedGroupKFold with n_splits = n_unique_donors so each donor
-    is the held-out test set exactly once.
-
-    Returns
-    -------
-    results : dict with per-fold and aggregate metrics
-    all_y_true : array of true labels in test-set order
-    all_y_prob : array of predicted probabilities
-    all_donors : array of donor IDs for each test-set prediction
-    coef_df    : DataFrame of feature importances / coefficients (mean across folds)
+    Leave-donor-out CV. To ensure each test fold contains both classes,
+    we group donors rather than holding out one at a time. With 15 AD and
+    9 N donors, we use n_splits=9 (matching the minority class size) so
+    each fold gets ~1-2 donors per class in the test set.
     """
     donors = groups.unique()
-    n_folds = len(donors)
+    n_donors = len(donors)
+
+    # Compute donor-level labels to determine safe n_splits
+    donor_labels = y.groupby(groups).first()
+    n_minority = donor_labels.value_counts().min()
+    # n_splits capped at minority class donor count to guarantee both 
+    # classes appear in every test fold
+    n_splits = min(n_minority, 9)
     log.info(
-        f"  Leave-donor-out CV: {n_folds} folds "
-        f"({(y==1).sum()} AD samples, {(y==0).sum()} N samples)"
+        f"  {n_donors} donors ({(donor_labels==1).sum()} AD, {(donor_labels==0).sum()} N) "
+        f"→ using {n_splits}-fold leave-donor-group-out CV"
     )
 
-    cv = StratifiedGroupKFold(n_splits=n_folds)
+    cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
     all_y_true, all_y_prob, all_donors = [], [], []
     fold_aucs, fold_aps = [], []
@@ -480,8 +435,21 @@ def leave_donor_out_cv(X: pd.DataFrame,
         model.fit(X_train, y_train)
         y_prob = model.predict_proba(X_test)[:, 1]
 
-        auc = roc_auc_score(y_test, y_prob) if len(np.unique(y_test)) > 1 else float("nan")
-        ap  = average_precision_score(y_test, y_prob) if len(np.unique(y_test)) > 1 else float("nan")
+        n_classes_in_test = len(np.unique(y_test))
+        if n_classes_in_test < 2:
+            auc = float("nan")
+            ap  = float("nan")
+            log.warning(
+                f"    Fold {fold_i+1:2d} | single-class test set "
+                f"— AUC/AP undefined, excluded from fold summary"
+            )
+        else:
+            auc = roc_auc_score(y_test, y_prob)
+            ap  = average_precision_score(y_test, y_prob)
+            log.info(
+                f"    Fold {fold_i+1:2d} | donors={donor_test.nunique()} "
+                f"n_test={len(y_test)} | AUC={auc:.3f}  AP={ap:.3f}"
+            )
 
         fold_aucs.append(auc)
         fold_aps.append(ap)
@@ -489,43 +457,48 @@ def leave_donor_out_cv(X: pd.DataFrame,
         all_y_prob.extend(y_prob.tolist())
         all_donors.extend(donor_test.tolist())
 
-        # Accumulate feature importances
         clf = model.named_steps["clf"]
         if hasattr(clf, "coef_"):
             coef_accum += np.abs(clf.coef_[0])
         elif hasattr(clf, "feature_importances_"):
             coef_accum += clf.feature_importances_
 
-        test_donor = donor_test.iloc[0]
-        log.info(f"    Fold {fold_i+1:2d} | donor {test_donor:>8} | "
-                 f"AUC={auc:.3f}  AP={ap:.3f}  n_test={len(y_test)}")
-
     all_y_true = np.array(all_y_true)
     all_y_prob = np.array(all_y_prob)
 
-    # Aggregate metrics
     overall_auc = roc_auc_score(all_y_true, all_y_prob)
     overall_ap  = average_precision_score(all_y_true, all_y_prob)
 
+    valid_fold_aucs = [a for a in fold_aucs if not np.isnan(a)]
+
     log.info(f"\n  === CV Results ===")
-    log.info(f"  Per-fold AUC: mean={np.nanmean(fold_aucs):.3f}  "
-             f"std={np.nanstd(fold_aucs):.3f}  "
-             f"[{np.nanmin(fold_aucs):.3f}, {np.nanmax(fold_aucs):.3f}]")
+    log.info(f"  {len(valid_fold_aucs)}/{n_splits} folds had ≥2 classes in test set")
+
+    if valid_fold_aucs:
+        log.info(
+            f"  Per-fold AUC: mean={np.mean(valid_fold_aucs):.3f}  "
+            f"std={np.std(valid_fold_aucs):.3f}  "
+            f"[{np.min(valid_fold_aucs):.3f}, {np.max(valid_fold_aucs):.3f}]"
+        )
+    else:
+        log.warning("  No valid per-fold AUCs — all test folds were single-class")
+
     log.info(f"  Pooled AUC (all test predictions): {overall_auc:.3f}")
     log.info(f"  Pooled Average Precision:          {overall_ap:.3f}")
 
-    mean_coef = coef_accum / n_folds
+    mean_coef = coef_accum / n_splits
     coef_df = pd.DataFrame({
         "feature": X.columns,
         "mean_abs_coef": mean_coef,
     }).sort_values("mean_abs_coef", ascending=False).reset_index(drop=True)
 
     results = {
-        "fold_aucs": fold_aucs,
-        "fold_aps": fold_aps,
-        "overall_auc": overall_auc,
-        "overall_ap": overall_ap,
-        "n_folds": n_folds,
+        "fold_aucs":     fold_aucs,
+        "fold_aps":      fold_aps,
+        "overall_auc":   overall_auc,
+        "overall_ap":    overall_ap,
+        "n_folds":       n_splits,
+        "n_valid_folds": len(valid_fold_aucs),
     }
     return results, all_y_true, all_y_prob, np.array(all_donors), coef_df
 
