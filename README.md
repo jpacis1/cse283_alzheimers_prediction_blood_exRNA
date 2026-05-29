@@ -44,7 +44,7 @@ Consists of 115 rows (one per sample) and 10 clinical fields. The primary fields
 ## AD classifer pipeline
 Run the pipeline through the following command:
 
-(this is a call i ran to make sure the pipeline was working)
+(this is a call i ran to make sure the pipeline was working, RESULTS ARE BAD lol but they are in the results section of the pipeline directory)
 ```
 python ad_classifier_pipeline.py \
     --counts   ../silver_seq/silver_seq_counts.txt \
