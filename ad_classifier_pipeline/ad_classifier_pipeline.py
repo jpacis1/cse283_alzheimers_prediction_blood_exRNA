@@ -363,22 +363,25 @@ def build_feature_matrix(gwas_expr: pd.DataFrame,
 # 8.  Leave-donor-out cross-validation
 # ═══════════════════════════════════════════════════════════════════════════
 
-def make_classifier(name: str, seed: int = 42):
+def make_classifier(name: str, seed: int = 42, C: float = 10.0):
     """
     Return a scikit-learn Pipeline with StandardScaler + chosen classifier.
 
     logistic   : L1-penalised logistic regression (sparse, interpretable)
     elasticnet : ElasticNet logistic (L1+L2 mix) — more stable than pure L1
     rf         : Random forest — non-parametric, handles interactions
+
+    C controls inverse regularization strength for the linear models
+    (higher C = looser regularization). Ignored for rf.
     """
     if name == "logistic":
         clf = LogisticRegression(
-            penalty="l1", solver="liblinear", C=0.1,
+            penalty="l1", solver="liblinear", C=C,
             max_iter=1000, random_state=seed
         )
     elif name == "elasticnet":
         clf = LogisticRegression(
-            penalty="elasticnet", solver="saga", C=0.1,
+            penalty="elasticnet", solver="saga", C=C,
             l1_ratio=0.5, max_iter=2000, random_state=seed
         )
     elif name == "rf":
@@ -392,7 +395,7 @@ def make_classifier(name: str, seed: int = 42):
     return Pipeline([("scaler", StandardScaler()), ("clf", clf)])
 
 
-def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_test_donors=2):
+def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_test_donors=2, C: float = 10.0):
     """
     Leave-donor-out CV. To ensure each test fold contains both classes,
     we group donors rather than holding out one at a time. With 15 AD and
@@ -412,6 +415,7 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
         f"  {n_donors} donors ({(donor_labels==1).sum()} AD, {(donor_labels==0).sum()} N) "
         f"→ using {n_splits}-fold leave-donor-group-out CV"
     )
+    log.info(f"  Classifier: {classifier_name}  |  C = {C}")
 
     cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
@@ -427,7 +431,7 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         donor_test = groups.iloc[test_idx]
 
-        model = make_classifier(classifier_name, seed)
+        model = make_classifier(classifier_name, seed, C=C)
         model.fit(X_train, y_train)
         y_prob = model.predict_proba(X_test)[:, 1]
 
@@ -744,6 +748,7 @@ def run_pipeline(
     min_samples_frac: float = 0.10,
     seed: int = 42,
     prefix: str = "silver",
+    C: float = 10.0,
 ):
     np.random.seed(seed)
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -793,7 +798,7 @@ def run_pipeline(
     # ── Step 7: Classification ────────────────────────────────────────────
     log.info(f"\n[7/8] Leave-donor-out CV with '{classifier_name}' classifier")
     results, y_true, y_prob, donors, coef_df, sign_df = leave_donor_out_cv(
-        X, y, groups, classifier_name, seed
+        X, y, groups, classifier_name, seed, C=C
     )
 
     # ── Step 8: Save & plot ───────────────────────────────────────────────
@@ -838,6 +843,9 @@ def parse_args():
     p.add_argument("--min_samples_frac", type=float, default=0.10,
                    help="Minimum fraction of samples with min_count reads")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
+    p.add_argument("--C", type=float, default=10.0,
+                   help="Inverse regularization strength for linear models "
+                        "(higher = looser). Ignored for rf.")
     return p.parse_args()
 
 
@@ -854,4 +862,5 @@ if __name__ == "__main__":
         min_samples_frac = args.min_samples_frac,
         seed             = args.seed,
         prefix           = args.prefix,
+        C                = args.C,
     )
