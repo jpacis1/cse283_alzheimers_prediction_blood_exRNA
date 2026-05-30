@@ -228,31 +228,24 @@ def normalize(counts: pd.DataFrame, meta: pd.DataFrame,
 
 def build_ensembl_to_symbol_map(ensembl_ids: pd.Index) -> dict:
     """
-    Map ENSEMBL gene IDs to HGNC symbols using mygene.info REST API.
-    Falls back to an empty dict if the API is unavailable (offline run).
-    The caller should always handle genes that are not mapped (they stay
-    as ENSEMBL IDs and will likely not match GWAS symbols).
+    Map ENSEMBL gene IDs to HGNC symbols using the official mygene client.
+    The client uses POST and handles batching internally, avoiding the URL
+    length limits that broke a previous GET-based implementation.
+    Returns an empty dict if the API is unavailable (offline run).
     """
     try:
-        import urllib.request, json
-        chunk_size = 500
-        mapping = {}
+        import mygene
+        mg = mygene.MyGeneInfo()
         ids = list(ensembl_ids)
-        for i in range(0, len(ids), chunk_size):
-            chunk = ids[i : i + chunk_size]
-            query = ",".join(chunk)
-            url = (
-                "https://mygene.info/v3/gene?fields=symbol"
-                f"&ids={query}&species=human"
-            )
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                results = json.loads(r.read())
-            for rec in results:
-                eid = rec.get("query", "")
-                sym = rec.get("symbol", "")
-                if eid and sym:
-                    mapping[eid] = sym
+        results = mg.querymany(
+            ids, scopes="ensembl.gene", fields="symbol",
+            species="human", returnall=False, verbose=False,
+        )
+        mapping = {
+            r["query"]: r["symbol"]
+            for r in results
+            if "symbol" in r and "notfound" not in r
+        }
         log.info(f"  Mapped {len(mapping)} / {len(ids)} ENSEMBL IDs to symbols")
         return mapping
     except Exception as e:
@@ -333,9 +326,9 @@ def encode_covariates(meta: pd.DataFrame) -> pd.DataFrame:
         cov["age"] = pd.to_numeric(meta["age"], errors="coerce")
         cov["age"] = cov["age"].fillna(cov["age"].mean())
 
-    if "year_sample" in meta.columns:
-        cov["year_sample"] = pd.to_numeric(meta["year_sample"], errors="coerce")
-        cov["year_sample"] = cov["year_sample"].fillna(cov["year_sample"].mean())
+    # year_sample intentionally excluded — collection-time batch variable,
+    # not biology. AD samples skew later (mean 2006.8 vs 2004.6 for N), so
+    # including it leaks cohort timing into the classifier.
 
     # braak_stage intentionally excluded — direct proxy for the label
 
@@ -370,22 +363,25 @@ def build_feature_matrix(gwas_expr: pd.DataFrame,
 # 8.  Leave-donor-out cross-validation
 # ═══════════════════════════════════════════════════════════════════════════
 
-def make_classifier(name: str, seed: int = 42):
+def make_classifier(name: str, seed: int = 42, C: float = 10.0):
     """
     Return a scikit-learn Pipeline with StandardScaler + chosen classifier.
 
     logistic   : L1-penalised logistic regression (sparse, interpretable)
     elasticnet : ElasticNet logistic (L1+L2 mix) — more stable than pure L1
     rf         : Random forest — non-parametric, handles interactions
+
+    C controls inverse regularization strength for the linear models
+    (higher C = looser regularization). Ignored for rf.
     """
     if name == "logistic":
         clf = LogisticRegression(
-            penalty="l1", solver="liblinear", C=0.1,
+            penalty="l1", solver="liblinear", C=C,
             max_iter=1000, random_state=seed
         )
     elif name == "elasticnet":
         clf = LogisticRegression(
-            penalty="elasticnet", solver="saga", C=0.1,
+            penalty="elasticnet", solver="saga", C=C,
             l1_ratio=0.5, max_iter=2000, random_state=seed
         )
     elif name == "rf":
@@ -399,7 +395,7 @@ def make_classifier(name: str, seed: int = 42):
     return Pipeline([("scaler", StandardScaler()), ("clf", clf)])
 
 
-def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_test_donors=2):
+def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_test_donors=2, C: float = 10.0):
     """
     Leave-donor-out CV. To ensure each test fold contains both classes,
     we group donors rather than holding out one at a time. With 15 AD and
@@ -419,19 +415,23 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
         f"  {n_donors} donors ({(donor_labels==1).sum()} AD, {(donor_labels==0).sum()} N) "
         f"→ using {n_splits}-fold leave-donor-group-out CV"
     )
+    log.info(f"  Classifier: {classifier_name}  |  C = {C}")
 
     cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
     all_y_true, all_y_prob, all_donors = [], [], []
     fold_aucs, fold_aps = [], []
     coef_accum = np.zeros(X.shape[1])
+    # Per-fold signed coefficients (linear models only); rows = folds.
+    # Stays empty for non-linear models like RF.
+    signed_coefs_per_fold = []
 
     for fold_i, (train_idx, test_idx) in enumerate(cv.split(X, y, groups)):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         donor_test = groups.iloc[test_idx]
 
-        model = make_classifier(classifier_name, seed)
+        model = make_classifier(classifier_name, seed, C=C)
         model.fit(X_train, y_train)
         y_prob = model.predict_proba(X_test)[:, 1]
 
@@ -459,7 +459,9 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
 
         clf = model.named_steps["clf"]
         if hasattr(clf, "coef_"):
-            coef_accum += np.abs(clf.coef_[0])
+            signed = clf.coef_[0]
+            coef_accum += np.abs(signed)
+            signed_coefs_per_fold.append(signed)
         elif hasattr(clf, "feature_importances_"):
             coef_accum += clf.feature_importances_
 
@@ -492,6 +494,41 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
         "mean_abs_coef": mean_coef,
     }).sort_values("mean_abs_coef", ascending=False).reset_index(drop=True)
 
+    # Sign-stability table for linear models: did each feature's coefficient
+    # point the same direction in every fold? A feature that flips signs is
+    # picking up donor-specific noise rather than disease signal.
+    sign_df = None
+    if signed_coefs_per_fold:
+        signed_mat = np.vstack(signed_coefs_per_fold)        # (n_folds, n_features)
+        n_pos = (signed_mat > 0).sum(axis=0)
+        n_neg = (signed_mat < 0).sum(axis=0)
+        n_nz  = n_pos + n_neg
+        # Fraction of nonzero folds that agree with the majority sign.
+        # 1.0 = perfectly consistent direction; 0.5 = coin-flip.
+        majority = np.maximum(n_pos, n_neg)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sign_consistency = np.where(n_nz > 0, majority / n_nz, np.nan)
+        sign_df = pd.DataFrame({
+            "feature":          X.columns,
+            "mean_signed_coef": signed_mat.mean(axis=0),
+            "mean_abs_coef":    mean_coef,
+            "n_folds_pos":      n_pos,
+            "n_folds_neg":      n_neg,
+            "n_folds_nonzero":  n_nz,
+            "sign_consistency": sign_consistency,
+        }).sort_values("mean_abs_coef", ascending=False).reset_index(drop=True)
+
+        # Log diagnostic on the top features
+        top = sign_df.head(15)
+        log.info("\n  === Sign stability of top 15 features (by mean |coef|) ===")
+        log.info(f"  {'feature':<25} {'mean_signed':>12} {'+folds':>7} {'-folds':>7} {'consistency':>12}")
+        for _, r in top.iterrows():
+            log.info(
+                f"  {r['feature']:<25} {r['mean_signed_coef']:>12.4f} "
+                f"{int(r['n_folds_pos']):>7d} {int(r['n_folds_neg']):>7d} "
+                f"{r['sign_consistency']:>12.2f}"
+            )
+
     results = {
         "fold_aucs":     fold_aucs,
         "fold_aps":      fold_aps,
@@ -500,7 +537,7 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
         "n_folds":       n_splits,
         "n_valid_folds": len(valid_fold_aucs),
     }
-    return results, all_y_true, all_y_prob, np.array(all_donors), coef_df
+    return results, all_y_true, all_y_prob, np.array(all_donors), coef_df, sign_df
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -658,7 +695,7 @@ def plot_library_sizes(counts: pd.DataFrame, meta: pd.DataFrame,
 # ═══════════════════════════════════════════════════════════════════════════
 
 def save_results(results, coef_df, all_y_true, all_y_prob, all_donors,
-                 output_dir, prefix="silver"):
+                 output_dir, prefix="silver", sign_df=None):
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -681,6 +718,10 @@ def save_results(results, coef_df, all_y_true, all_y_prob, all_donors,
 
     # Feature importances
     coef_df.to_csv(out / f"{prefix}_feature_importances.csv", index=False)
+
+    # Signed-coefficient sign-stability table (linear models only)
+    if sign_df is not None:
+        sign_df.to_csv(out / f"{prefix}_coef_sign_stability.csv", index=False)
 
     # Per-sample predictions
     pd.DataFrame({
@@ -707,6 +748,7 @@ def run_pipeline(
     min_samples_frac: float = 0.10,
     seed: int = 42,
     prefix: str = "silver",
+    C: float = 10.0,
 ):
     np.random.seed(seed)
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -755,13 +797,14 @@ def run_pipeline(
 
     # ── Step 7: Classification ────────────────────────────────────────────
     log.info(f"\n[7/8] Leave-donor-out CV with '{classifier_name}' classifier")
-    results, y_true, y_prob, donors, coef_df = leave_donor_out_cv(
-        X, y, groups, classifier_name, seed
+    results, y_true, y_prob, donors, coef_df, sign_df = leave_donor_out_cv(
+        X, y, groups, classifier_name, seed, C=C
     )
 
     # ── Step 8: Save & plot ───────────────────────────────────────────────
     log.info("\n[8/8] Saving results and plots")
-    save_results(results, coef_df, y_true, y_prob, donors, output_dir, prefix)
+    save_results(results, coef_df, y_true, y_prob, donors, output_dir, prefix,
+                 sign_df=sign_df)
     plot_roc_pr(y_true, y_prob, output_dir, prefix)
     plot_fold_aucs(results["fold_aucs"], output_dir, prefix)
     plot_top_features(coef_df, n=min(30, len(coef_df)), output_dir=output_dir, prefix=prefix)
@@ -800,6 +843,9 @@ def parse_args():
     p.add_argument("--min_samples_frac", type=float, default=0.10,
                    help="Minimum fraction of samples with min_count reads")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
+    p.add_argument("--C", type=float, default=10.0,
+                   help="Inverse regularization strength for linear models "
+                        "(higher = looser). Ignored for rf.")
     return p.parse_args()
 
 
@@ -816,4 +862,5 @@ if __name__ == "__main__":
         min_samples_frac = args.min_samples_frac,
         seed             = args.seed,
         prefix           = args.prefix,
+        C                = args.C,
     )
