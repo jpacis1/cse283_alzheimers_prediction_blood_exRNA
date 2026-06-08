@@ -89,6 +89,7 @@ All outputs are written to the directory specified by `--output_dir` (default is
 ## Conda environment
 ```
 conda create -n ad_silverseq_env
+conda activate ad_silverseq_env
 mamba install numpy pandas matplotlib seaborn scipy scikit-learn -c conda-forge
 mamba install openpyxl
 ```
