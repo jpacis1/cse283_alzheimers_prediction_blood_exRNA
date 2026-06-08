@@ -1,13 +1,13 @@
 """
-AD Blood exRNA Classifier Pipeline
-===================================
-Preprocessing and classification pipeline for predicting Alzheimer's Disease
-from blood exRNA (SILVER-seq) data, integrating AD GWAS gene sets with
-clinical covariates (ApoE status, age, sex when available).
+AD Blood exRNA Classifier Pipeline!!!!
 
-Usage
+preprocessing and classification pipeline for predicting Alzheimer's Disease
+from blood exRNA SILVER-seq data, integrating AD GWAS gene sets with
+clinical covariates (ApoE carrier status, risk allele dosage).
+
+Command to run pipeline
 -----
-    python ad_classifier_pipeline.py \
+    python ad_classifier_pipeline_v2.py \
         --counts silver_seq_counts.txt \
         --metadata silver_seq_metadata.xlsx \
         --gwas ad_gwas_hits.csv \
@@ -18,17 +18,13 @@ Usage
         [--min_samples_frac 0.1] \
         [--seed 42]
 
-GWAS CSV format expected
-------------------------
-The file must contain at minimum a gene-name column. The parser looks for
-a column whose header contains "gene" (case-insensitive), e.g.:
-    "Reported Gene/ Closest gene"  →  parsed as gene names
-Multiple genes per cell separated by "/" or "," are split automatically.
+GWAS CSV format expected to run the pipeline
+--------------------------------------------
+The file must contain a gene-name column.
 ENSEMBL IDs in the count matrix are mapped to HGNC symbols via a bundled
-lookup; if no match, the gene is silently dropped from the feature set.
+lookup. If no match, the gene is dropped from the filtered feature set.
 """
-
-# ── Stdlib ─────────────────────────────────────────────────────────────────
+# updated in conda virtual environment section of README.md
 import argparse
 import logging
 import os
@@ -39,7 +35,6 @@ from pathlib import Path
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# ── Third-party ─────────────────────────────────────────────────────────────
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -60,7 +55,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import StratifiedGroupKFold
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# logging to keep track of bugs that come up in the pipeline
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -69,40 +64,24 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 1.  GWAS gene-set loading
-# ═══════════════════════════════════════════════════════════════════════════
+# 1.  Utilizing the GWAS gene list form ADSP
 
 def load_gwas_genes(gwas_csv: str) -> set:
-    """
-    Read a pre-wrangled GWAS CSV with a 'gene_symbol' column
-    (output of load_gwas_combined).
-    """
     log.info(f"Loading GWAS gene list from: {gwas_csv}")
     df = pd.read_csv(gwas_csv)
-    
     if "gene_symbol" not in df.columns:
         raise ValueError(
             f"Expected a 'gene_symbol' column but found: {df.columns.tolist()}\n"
-            "Make sure you're passing the wrangled output CSV, not the raw ADSP file."
         )
-    
     genes = set(df["gene_symbol"].dropna().str.strip())
     genes.discard("")
     log.info(f"  Loaded {len(genes)} unique GWAS gene symbols")
     return genes
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 2.  Count matrix loading and sample alignment
-# ═══════════════════════════════════════════════════════════════════════════
+# 2.  Using the SILVER-seq count matrix provided by Sheng Zhong @ UCSD
 
 def load_counts(counts_path: str) -> pd.DataFrame:
-    """
-    Load featureCounts output.
-    Rows = ENSEMBL gene IDs, columns = sample IDs.
-    Returns counts as integers.
-    """
     log.info(f"Loading count matrix from: {counts_path}")
     counts = pd.read_csv(counts_path, sep="\t", index_col=0)
     log.info(f"  Count matrix: {counts.shape[0]} genes × {counts.shape[1]} samples")
@@ -110,10 +89,6 @@ def load_counts(counts_path: str) -> pd.DataFrame:
 
 
 def load_metadata(meta_path: str) -> pd.DataFrame:
-    """
-    Load sample metadata from Excel.
-    Returns DataFrame indexed by sample_id_alias.
-    """
     log.info(f"Loading metadata from: {meta_path}")
     meta = pd.read_excel(meta_path)
     meta = meta.set_index("sample_id_alias")
@@ -122,13 +97,9 @@ def load_metadata(meta_path: str) -> pd.DataFrame:
 
 
 def align_samples(counts: pd.DataFrame, meta: pd.DataFrame):
-    """
-    Keep only samples present in both count matrix and metadata,
-    in the same order.
-    """
     common = counts.columns.intersection(meta.index)
     if len(common) == 0:
-        raise ValueError("No overlapping sample IDs between count matrix and metadata!")
+        raise ValueError("No overlapping sample IDs between count matrix and metadata!!!!!!")
     n_drop = counts.shape[1] - len(common)
     if n_drop > 0:
         log.warning(f"  Dropping {n_drop} samples not in metadata")
@@ -137,10 +108,7 @@ def align_samples(counts: pd.DataFrame, meta: pd.DataFrame):
     log.info(f"  Aligned: {len(common)} samples retained")
     return counts, meta
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 3.  Low-count gene filtering
-# ═══════════════════════════════════════════════════════════════════════════
+# 3.  Filtering out genes with low counts to avoid driving high dimensional separate with low abundant txs
 
 def filter_low_counts(counts: pd.DataFrame,
                       min_count: int = 10,
@@ -159,10 +127,8 @@ def filter_low_counts(counts: pd.DataFrame,
     )
     return filtered
 
+# 4.  Normalizing for library size differences between our SILVER-seq samples
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 4.  Normalization
-# ═══════════════════════════════════════════════════════════════════════════
 
 def normalize_cpm_log2(counts: pd.DataFrame,
                        pseudo: float = 1.0) -> pd.DataFrame:
@@ -179,17 +145,14 @@ def normalize_cpm_log2(counts: pd.DataFrame,
 
 
 def normalize_vst(counts: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
-    """
-    DESeq2-style variance-stabilising transformation via PyDESeq2.
-    Falls back to log2-CPM if PyDESeq2 is unavailable or fails.
-    """
+#using python implementation of DESeq
     try:
         from pydeseq2.dds import DeseqDataSet
         from pydeseq2.default_inference import DefaultInference
         from pydeseq2.ds import DeseqStats
 
         log.info("  Normalisation: DESeq2 VST (via PyDESeq2)")
-        # PyDESeq2 expects samples on rows
+        # NOTE: PyDESeq2 expects samples on rows
         counts_T = counts.T.copy()
         counts_T.index.name = "sample"
 
@@ -206,9 +169,9 @@ def normalize_vst(counts: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
         dds.deseq2()
 
         dds.vst(use_design=False)
-        vst_mat = dds.layers["vst_counts"]           # samples × genes
+        vst_mat = dds.layers["vst_counts"]           
         vst_df = pd.DataFrame(
-            vst_mat.T,                               # back to genes × samples
+            vst_mat.T,                               
             index=counts.index,
             columns=counts.columns,
         )
@@ -224,18 +187,9 @@ def normalize(counts: pd.DataFrame, meta: pd.DataFrame,
         return normalize_vst(counts, meta)
     return normalize_cpm_log2(counts)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 5.  ENSEMBL → HGNC symbol mapping
-# ═══════════════════════════════════════════════════════════════════════════
+# 5.  going from ENSEMBL → HGNC symbol mapping for downstream biological interpretaiton!
 
 def build_ensembl_to_symbol_map(ensembl_ids: pd.Index) -> dict:
-    """
-    Map ENSEMBL gene IDs to HGNC symbols using the official mygene client.
-    The client uses POST and handles batching internally, avoiding the URL
-    length limits that broke a previous GET-based implementation.
-    Returns an empty dict if the API is unavailable (offline run).
-    """
     try:
         import mygene
         mg = mygene.MyGeneInfo()
@@ -259,32 +213,22 @@ def build_ensembl_to_symbol_map(ensembl_ids: pd.Index) -> dict:
 def gwas_filter_expression(norm_expr: pd.DataFrame,
                             gwas_genes: set,
                             ensembl_map: dict) -> pd.DataFrame:
-    """
-    Subset normalised expression to rows matching any GWAS gene.
-    Matching is done symbol-first (via ensembl_map), then raw index
-    (in case the index already contains symbols).
-    Returns a genes × samples DataFrame.
-    """
-    # Build reverse: gene symbol → list of ENSEMBL IDs
     symbol_to_ensembl = {}
     for eid, sym in ensembl_map.items():
         symbol_to_ensembl.setdefault(sym, []).append(eid)
 
     selected_rows = []
     matched_symbols = set()
-
     for gene in gwas_genes:
         eids = symbol_to_ensembl.get(gene, [])
         for eid in eids:
             if eid in norm_expr.index:
                 selected_rows.append(eid)
                 matched_symbols.add(gene)
-        # Also check if the gene symbol is already the index (non-ENSEMBL matrix)
         if gene in norm_expr.index:
             selected_rows.append(gene)
             matched_symbols.add(gene)
-
-    selected_rows = list(dict.fromkeys(selected_rows))  # deduplicate, preserve order
+    selected_rows = list(dict.fromkeys(selected_rows)) 
     log.info(
         f"  GWAS gene filter: {len(matched_symbols)} / {len(gwas_genes)} "
         f"GWAS genes found in expression matrix → {len(selected_rows)} feature rows"
@@ -297,74 +241,43 @@ def gwas_filter_expression(norm_expr: pd.DataFrame,
             "Using full normalised matrix as fallback (not recommended)."
         )
         return norm_expr
-
     return norm_expr.loc[selected_rows]
 
-# DEGs
+# looking at the differentially expressed genes to also add to dataset to see if it improves performance...
 
 def log2fc_filter_expression(norm_expr: pd.DataFrame, meta: pd.DataFrame, n_genes = 100) -> pd.DataFrame:
-
     ad_samples = meta[meta['donor_group'] == 'AD'].index
     n_samples = meta[meta['donor_group'] == 'N'].index
     sorted_log2fc_genes = abs(norm_expr[ad_samples].mean(axis=1) - norm_expr[n_samples].mean(axis=1)).sort_values(ascending=False).head(n_genes).index
     results_df = norm_expr.loc[sorted_log2fc_genes]
-
     return results_df
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 6.  Clinical covariate encoding
-# ═══════════════════════════════════════════════════════════════════════════
-
+# 6.  Using covariates in classification task, but explicitely dropping Braak stage and the year sample was taken
+# Braak stage essentially acts as a proxy label for AD vs ctrl and later samples were correlated with AD samples
 def encode_covariates(meta: pd.DataFrame) -> pd.DataFrame:
-    """
-    Encode clinical covariates. Braak stage is EXCLUDED — it is a 
-    post-mortem neuropathological measure that directly defines the 
-    AD/N label and would constitute target leakage.
-    """
     cov = pd.DataFrame(index=meta.index)
-
     if "apoe_carrier" in meta.columns:
         cov["apoe4_carrier"] = (meta["apoe_carrier"] == "apoe4").astype(float)
-
     if "apoe_dose" in meta.columns:
         dose_map = {"no_apoe4": 0, "apoe4": 1, "apoe44": 2}
         cov["apoe4_dose"] = meta["apoe_dose"].map(dose_map).fillna(0).astype(float)
-
     if "sex" in meta.columns:
         cov["sex_male"] = meta["sex"].str.lower().map(
             {"m": 1, "male": 1, "f": 0, "female": 0}
         ).fillna(0).astype(float)
-
     if "age" in meta.columns:
         cov["age"] = pd.to_numeric(meta["age"], errors="coerce")
         cov["age"] = cov["age"].fillna(cov["age"].mean())
-
-    # year_sample intentionally excluded — collection-time batch variable,
-    # not biology. AD samples skew later (mean 2006.8 vs 2004.6 for N), so
-    # including it leaks cohort timing into the classifier.
-
-    # braak_stage intentionally excluded — direct proxy for the label
-
     log.info(f"  Encoded covariates: {cov.columns.tolist()}")
     return cov.astype("float32")
 
+# 7.  Updating and constructing the new feature matrix
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 7.  Feature matrix assembly
-# ═══════════════════════════════════════════════════════════════════════════
 
 def build_feature_matrix(gwas_expr: pd.DataFrame,
                          covariates: pd.DataFrame) -> pd.DataFrame:
-    """
-    Transpose expression (genes → columns) and join clinical covariates.
-    Returns a samples × features DataFrame.
-    """
-    # Samples × genes
     X_expr = gwas_expr.T.copy()
     X_expr.columns = [f"expr_{c}" for c in X_expr.columns]
-    
-
-    # Join covariates
     X = X_expr.join(covariates, how="inner")
     log.info(
         f"  Feature matrix assembled: {X.shape[0]} samples × {X.shape[1]} features "
@@ -372,22 +285,9 @@ def build_feature_matrix(gwas_expr: pd.DataFrame,
     )
     return X
 
-
-# ═══════════════════════════════════════════════════════════════════════════
 # 8.  Leave-donor-out cross-validation
-# ═══════════════════════════════════════════════════════════════════════════
 
 def make_classifier(name: str, seed: int = 42, C: float = 10.0):
-    """
-    Return a scikit-learn Pipeline with StandardScaler + chosen classifier.
-
-    logistic   : L1-penalised logistic regression (sparse, interpretable)
-    elasticnet : ElasticNet logistic (L1+L2 mix) — more stable than pure L1
-    rf         : Random forest — non-parametric, handles interactions
-
-    C controls inverse regularization strength for the linear models
-    (higher C = looser regularization). Ignored for rf.
-    """
     if name == "logistic":
         clf = LogisticRegression(
             penalty="l1", solver="liblinear", C=C,
@@ -412,20 +312,11 @@ def make_classifier(name: str, seed: int = 42, C: float = 10.0):
 
 
 def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_test_donors=2, C: float = 10.0):
-    """
-    Leave-donor-out CV. To ensure each test fold contains both classes,
-    we group donors rather than holding out one at a time. With 15 AD and
-    9 N donors, we use n_splits=9 (matching the minority class size) so
-    each fold gets ~1-2 donors per class in the test set.
-    """
     donors = groups.unique()
     n_donors = len(donors)
-
-    # Compute donor-level labels to determine safe n_splits
     donor_labels = y.groupby(groups).first()
     n_minority = donor_labels.value_counts().min()
-    # n_splits capped at minority class donor count to guarantee both 
-    # classes appear in every test fold
+                # classes appear in every test fold????
     n_splits = min(n_minority, 9)
     log.info(
         f"  {n_donors} donors ({(donor_labels==1).sum()} AD, {(donor_labels==0).sum()} N) "
@@ -438,8 +329,6 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
     all_y_true, all_y_prob, all_donors = [], [], []
     fold_aucs, fold_aps = [], []
     coef_accum = np.zeros(X.shape[1])
-    # Per-fold signed coefficients (linear models only); rows = folds.
-    # Stays empty for non-linear models like RF.
     signed_coefs_per_fold = []
 
     for fold_i, (train_idx, test_idx) in enumerate(cv.split(X, y, groups)):
@@ -489,7 +378,7 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
 
     valid_fold_aucs = [a for a in fold_aucs if not np.isnan(a)]
 
-    log.info(f"\n  === CV Results ===")
+    log.info(f"\n CV Results")
     log.info(f"  {len(valid_fold_aucs)}/{n_splits} folds had ≥2 classes in test set")
 
     if valid_fold_aucs:
@@ -509,18 +398,12 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
         "feature": X.columns,
         "mean_abs_coef": mean_coef,
     }).sort_values("mean_abs_coef", ascending=False).reset_index(drop=True)
-
-    # Sign-stability table for linear models: did each feature's coefficient
-    # point the same direction in every fold? A feature that flips signs is
-    # picking up donor-specific noise rather than disease signal.
     sign_df = None
     if signed_coefs_per_fold:
-        signed_mat = np.vstack(signed_coefs_per_fold)        # (n_folds, n_features)
+        signed_mat = np.vstack(signed_coefs_per_fold)        
         n_pos = (signed_mat > 0).sum(axis=0)
         n_neg = (signed_mat < 0).sum(axis=0)
         n_nz  = n_pos + n_neg
-        # Fraction of nonzero folds that agree with the majority sign.
-        # 1.0 = perfectly consistent direction; 0.5 = coin-flip.
         majority = np.maximum(n_pos, n_neg)
         with np.errstate(divide="ignore", invalid="ignore"):
             sign_consistency = np.where(n_nz > 0, majority / n_nz, np.nan)
@@ -533,8 +416,6 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
             "n_folds_nonzero":  n_nz,
             "sign_consistency": sign_consistency,
         }).sort_values("mean_abs_coef", ascending=False).reset_index(drop=True)
-
-        # Log diagnostic on the top features
         top = sign_df.head(15)
         log.info("\n  === Sign stability of top 15 features (by mean |coef|) ===")
         log.info(f"  {'feature':<25} {'mean_signed':>12} {'+folds':>7} {'-folds':>7} {'consistency':>12}")
@@ -556,15 +437,13 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
     return results, all_y_true, all_y_prob, np.array(all_donors), coef_df, sign_df
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 9.  Visualization
-# ═══════════════════════════════════════════════════════════════════════════
+
+# Plots for visualization of results
 
 PALETTE = {"AD": "#D85A30", "N": "#1D9E75"}
 
 
 def plot_roc_pr(y_true, y_prob, output_dir, prefix="silver"):
-    """ROC and PR curves on a single figure."""
     fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
 
     # ROC
@@ -601,7 +480,7 @@ def plot_roc_pr(y_true, y_prob, output_dir, prefix="silver"):
 
 
 def plot_fold_aucs(fold_aucs, output_dir, prefix="silver"):
-    """Strip + box plot of per-fold AUCs."""
+    # getting rid of rendant features to clean plots!!!!!
     fig, ax = plt.subplots(figsize=(6, 3.5))
     jitter = np.random.default_rng(0).uniform(-0.05, 0.05, len(fold_aucs))
     ax.scatter(np.ones(len(fold_aucs)) + jitter, fold_aucs,
@@ -628,7 +507,6 @@ def plot_fold_aucs(fold_aucs, output_dir, prefix="silver"):
 
 
 def plot_top_features(coef_df, n=30, output_dir=".", prefix="silver"):
-    """Horizontal bar chart of top feature importances."""
     top = coef_df.head(n).copy()
     top["label"] = top["feature"].str.replace("expr_", "", regex=False)
 
@@ -654,10 +532,6 @@ def plot_top_features(coef_df, n=30, output_dir=".", prefix="silver"):
 
 
 def plot_prediction_scores(y_true, y_prob, donors, output_dir, prefix="silver"):
-    """
-    Dot plot of predicted AD probability per donor (mean of test samples),
-    coloured by true label.
-    """
     df = pd.DataFrame({"donor": donors, "y_true": y_true, "y_prob": y_prob})
     donor_agg = df.groupby("donor").agg(
         mean_prob=("y_prob", "mean"),
@@ -687,7 +561,6 @@ def plot_prediction_scores(y_true, y_prob, donors, output_dir, prefix="silver"):
 
 def plot_library_sizes(counts: pd.DataFrame, meta: pd.DataFrame,
                        output_dir=".", prefix="silver"):
-    """Library size distribution coloured by group."""
     lib = counts.sum(axis=0).rename("lib_size").to_frame()
     lib = lib.join(meta[["donor_group"]])
     fig, ax = plt.subplots(figsize=(7, 3.5))
@@ -706,16 +579,12 @@ def plot_library_sizes(counts: pd.DataFrame, meta: pd.DataFrame,
     log.info(f"  Saved: {out}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 10.  Save outputs
-# ═══════════════════════════════════════════════════════════════════════════
-
 def save_results(results, coef_df, all_y_true, all_y_prob, all_donors,
                  output_dir, prefix="silver", sign_df=None):
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Summary metrics
+    # summary metrics!!
     metrics = {
         "overall_auc": results["overall_auc"],
         "overall_ap":  results["overall_ap"],
@@ -749,9 +618,8 @@ def save_results(results, coef_df, all_y_true, all_y_prob, all_donors,
     log.info(f"  Saved all results to: {out}/")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 11.  Main pipeline
-# ═══════════════════════════════════════════════════════════════════════════
+
+## Pipeline command ##
 
 def run_pipeline(
     counts_path: str,
@@ -773,29 +641,29 @@ def run_pipeline(
     log.info("AD CLASSIFIER PIPELINE")
     log.info("=" * 60)
 
-    # ── Step 1: Load data ──────────────────────────────────────────────────
+    #Load data
     log.info("\n[1/8] Loading data")
     counts  = load_counts(counts_path)
     meta    = load_metadata(meta_path)
     gwas_genes = load_gwas_genes(gwas_csv)
 
-    # ── Step 2: Align samples ──────────────────────────────────────────────
+    #Align samples
     log.info("\n[2/8] Aligning samples")
     counts, meta = align_samples(counts, meta)
 
-    # ── Step 3: QC plot ────────────────────────────────────────────────────
+    #QC
     log.info("\n[3/8] QC — library sizes")
     plot_library_sizes(counts, meta, output_dir, prefix)
 
-    # ── Step 4: Filter low-count genes ────────────────────────────────────
+    #Filter low-count genes 
     log.info("\n[4/8] Filtering low-count genes")
     counts_filt = filter_low_counts(counts, min_count, min_samples_frac)
 
-    # ── Step 5: Normalise ─────────────────────────────────────────────────
-    log.info(f"\n[5/8] Normalising ({norm_method})")
+    #Normalizaation
+    log.info(f"\n[5/8] Normalizing ({norm_method})")
     norm_expr = normalize(counts_filt, meta, method=norm_method)
 
-    # ── Step 6: GWAS feature selection ────────────────────────────────────
+    #GWAS feature selection
     log.info("\n[6/8] GWAS gene filtering + feature assembly")
     ensembl_map = build_ensembl_to_symbol_map(norm_expr.index)
     gwas_expr   = gwas_filter_expression(norm_expr, gwas_genes, ensembl_map)
@@ -804,22 +672,20 @@ def run_pipeline(
     covariates  = encode_covariates(meta)
     X           = build_feature_matrix(gwas_expr, covariates)
 
-    # Align X and meta to same sample order
+    # adding in metadata
     common_samples = X.index.intersection(meta.index)
     X    = X.loc[common_samples]
     meta = meta.loc[common_samples]
-
-    # Labels (1 = AD, 0 = N)
     y      = (meta["donor_group"] == "AD").astype(int).rename("label")
     groups = meta["donor_id_alias"]          # donor grouping for CV
 
-    # ── Step 7: Classification ────────────────────────────────────────────
+    #classification 
     log.info(f"\n[7/8] Leave-donor-out CV with '{classifier_name}' classifier")
     results, y_true, y_prob, donors, coef_df, sign_df = leave_donor_out_cv(
         X, y, groups, classifier_name, seed, C=C
     )
 
-    # ── Step 8: Save & plot ───────────────────────────────────────────────
+    #for saving and plottoing
     log.info("\n[8/8] Saving results and plots")
     save_results(results, coef_df, y_true, y_prob, donors, output_dir, prefix,
                  sign_df=sign_df)
@@ -835,11 +701,6 @@ def run_pipeline(
     log.info("=" * 60)
 
     return results, coef_df
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# CLI
-# ═══════════════════════════════════════════════════════════════════════════
 
 def parse_args():
     p = argparse.ArgumentParser(
