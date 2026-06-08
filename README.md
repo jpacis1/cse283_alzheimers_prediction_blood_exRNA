@@ -82,7 +82,7 @@ All outputs are written to the directory specified by `--output_dir` (default is
 | `silver_donor_scores.png` | Per-donor mean predicted scores |
 | `silver_library_sizes.png` | QC plot: library size distribution |
 
-> **NOTE ON STATISTICS:** With only 24 donors (15 AD, 9 N), per-fold AUCs will naturally be noisy since some folds will only contain 3–5 test samples. The **pooled AUC** across all held-out samples serves as the more reliable summary metric.
+> **NOTE ON STATISTICS GENERATED FROM DATA:** With only 24 donors (15 AD, 9 N), per-fold AUCs will naturally be noisy since some folds will only contain 3–5 test samples. The **pooled AUC** across all held-out samples serves as the more reliable summary metric.
 
 ---
 
