@@ -26,7 +26,6 @@ lookup. If no match, the gene is dropped from the filtered feature set.
 """
 # updated in conda virtual environment section of README.md
 import argparse
-import logging
 import os
 import sys
 import warnings
@@ -54,20 +53,12 @@ from sklearn.metrics import (
     confusion_matrix, classification_report,
 )
 from sklearn.model_selection import StratifiedGroupKFold
-
-# logging to keep track of bugs that come up in the pipeline
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger(__name__)
+import pickle
 
 
 # 1.  Utilizing the GWAS gene list form ADSP
 
 def load_gwas_genes(gwas_csv: str) -> set:
-    log.info(f"Loading GWAS gene list from: {gwas_csv}")
     df = pd.read_csv(gwas_csv)
     if "gene_symbol" not in df.columns:
         raise ValueError(
@@ -75,24 +66,19 @@ def load_gwas_genes(gwas_csv: str) -> set:
         )
     genes = set(df["gene_symbol"].dropna().str.strip())
     genes.discard("")
-    log.info(f"  Loaded {len(genes)} unique GWAS gene symbols")
     return genes
 
 
 # 2.  Using the SILVER-seq count matrix provided by Sheng Zhong @ UCSD
 
 def load_counts(counts_path: str) -> pd.DataFrame:
-    log.info(f"Loading count matrix from: {counts_path}")
     counts = pd.read_csv(counts_path, sep="\t", index_col=0)
-    log.info(f"  Count matrix: {counts.shape[0]} genes × {counts.shape[1]} samples")
     return counts.astype(int)
 
 
 def load_metadata(meta_path: str) -> pd.DataFrame:
-    log.info(f"Loading metadata from: {meta_path}")
     meta = pd.read_excel(meta_path)
     meta = meta.set_index("sample_id_alias")
-    log.info(f"  Metadata: {meta.shape[0]} samples, columns: {meta.columns.tolist()}")
     return meta
 
 
@@ -101,11 +87,8 @@ def align_samples(counts: pd.DataFrame, meta: pd.DataFrame):
     if len(common) == 0:
         raise ValueError("No overlapping sample IDs between count matrix and metadata!!!!!!")
     n_drop = counts.shape[1] - len(common)
-    if n_drop > 0:
-        log.warning(f"  Dropping {n_drop} samples not in metadata")
     counts = counts[common]
     meta = meta.loc[common]
-    log.info(f"  Aligned: {len(common)} samples retained")
     return counts, meta
 
 # 3.  Filtering out genes with low counts to avoid driving high dimensional separate with low abundant txs
@@ -117,10 +100,6 @@ def filter_low_counts(counts: pd.DataFrame,
     min_samples = max(1, int(np.ceil(min_samples_frac * n_samples)))
     mask = (counts >= min_count).sum(axis=1) >= min_samples
     filtered = counts.loc[mask]
-    log.info(
-        f"  Low-count filter (>= {min_count} in >= {min_samples} samples): "
-        f"{counts.shape[0]} → {filtered.shape[0]} genes retained"
-    )
     return filtered
 
 # 4.  Normalizing for library size differences between our SILVER-seq samples
@@ -141,8 +120,6 @@ def normalize_vst(counts: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
         from pydeseq2.dds import DeseqDataSet
         from pydeseq2.default_inference import DefaultInference
         from pydeseq2.ds import DeseqStats
-
-        log.info("  Normalization: DESeq2 VST (via PyDESeq2)")
         # NOTE: PyDESeq2 expects samples on rows
         counts_T = counts.T.copy()
         counts_T.index.name = "sample"
@@ -168,7 +145,6 @@ def normalize_vst(counts: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
         )
         return vst_df
     except Exception as e:
-        log.warning(f"  VST failed ({e}); falling back to log2-CPM")
         return normalize_cpm_log2(counts)
 
 
@@ -194,10 +170,8 @@ def build_ensembl_to_symbol_map(ensembl_ids: pd.Index) -> dict:
             for r in results
             if "symbol" in r and "notfound" not in r
         }
-        log.info(f"  Mapped {len(mapping)} / {len(ids)} ENSEMBL IDs to symbols")
         return mapping
     except Exception as e:
-        log.warning(f"  ENSEMBL→symbol lookup failed ({e}); using ENSEMBL IDs directly")
         return {}
 
 
@@ -220,19 +194,21 @@ def gwas_filter_expression(norm_expr: pd.DataFrame,
             selected_rows.append(gene)
             matched_symbols.add(gene)
     selected_rows = list(dict.fromkeys(selected_rows)) 
-    log.info(
-        f"  GWAS gene filter: {len(matched_symbols)} / {len(gwas_genes)} "
-        f"GWAS genes found in expression matrix → {len(selected_rows)} feature rows"
-    )
 
     if len(selected_rows) == 0:
-        log.warning(
-            "  No GWAS genes matched expression matrix. "
-            "The ENSEMBL→symbol mapping may have failed. "
-            "Using full normalized matrix as fallback (not recommended)."
-        )
         return norm_expr
     return norm_expr.loc[selected_rows]
+
+# Calculate top log-fold change genes (no genes reached statistical significance after FDR) to include as potential inputs for the model
+
+def log2fc_filter_expression(norm_expr: pd.DataFrame, meta: pd.DataFrame, n_genes = 100) -> pd.DataFrame:
+
+    ad_samples = meta[meta['donor_group'] == 'AD'].index
+    n_samples = meta[meta['donor_group'] == 'N'].index
+    sorted_log2fc_genes = abs(norm_expr[ad_samples].mean(axis=1) - norm_expr[n_samples].mean(axis=1)).sort_values(ascending=False).head(n_genes).index
+    results_df = norm_expr.loc[sorted_log2fc_genes]
+
+    return results_df
 
 # looking at the differentially expressed genes to also add to dataset to see if it improves performance...
 
@@ -259,7 +235,6 @@ def encode_covariates(meta: pd.DataFrame) -> pd.DataFrame:
     if "age" in meta.columns:
         cov["age"] = pd.to_numeric(meta["age"], errors="coerce")
         cov["age"] = cov["age"].fillna(cov["age"].mean())
-    log.info(f"  Encoded covariates: {cov.columns.tolist()}")
     return cov.astype("float32")
 
 # 7.  Updating and constructing the new feature matrix
@@ -270,10 +245,6 @@ def build_feature_matrix(gwas_expr: pd.DataFrame,
     X_expr = gwas_expr.T.copy()
     X_expr.columns = [f"expr_{c}" for c in X_expr.columns]
     X = X_expr.join(covariates, how="inner")
-    log.info(
-        f"  Feature matrix assembled: {X.shape[0]} samples × {X.shape[1]} features "
-        f"({X_expr.shape[1]} expression + {covariates.shape[1]} clinical)"
-    )
     return X
 
 # 8.  Leave-donor-out cross-validation
@@ -309,11 +280,6 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
     n_minority = donor_labels.value_counts().min()
                 # classes appear in every test fold????
     n_splits = min(n_minority, 9)
-    log.info(
-        f"  {n_donors} donors ({(donor_labels==1).sum()} AD, {(donor_labels==0).sum()} N) "
-        f"→ using {n_splits}-fold leave-donor-group-out CV"
-    )
-    log.info(f"  Classifier: {classifier_name}  |  C = {C}")
 
     cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
@@ -335,17 +301,10 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
         if n_classes_in_test < 2:
             auc = float("nan")
             ap  = float("nan")
-            log.warning(
-                f"    Fold {fold_i+1:2d} | single-class test set "
-                f"— AUC/AP undefined, excluded from fold summary"
-            )
+        
         else:
             auc = roc_auc_score(y_test, y_prob)
             ap  = average_precision_score(y_test, y_prob)
-            log.info(
-                f"    Fold {fold_i+1:2d} | donors={donor_test.nunique()} "
-                f"n_test={len(y_test)} | AUC={auc:.3f}  AP={ap:.3f}"
-            )
 
         fold_aucs.append(auc)
         fold_aps.append(ap)
@@ -368,21 +327,6 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
     overall_ap  = average_precision_score(all_y_true, all_y_prob)
 
     valid_fold_aucs = [a for a in fold_aucs if not np.isnan(a)]
-
-    log.info(f"\n CV Results")
-    log.info(f"  {len(valid_fold_aucs)}/{n_splits} folds had ≥2 classes in test set")
-
-    if valid_fold_aucs:
-        log.info(
-            f"  Per-fold AUC: mean={np.mean(valid_fold_aucs):.3f}  "
-            f"std={np.std(valid_fold_aucs):.3f}  "
-            f"[{np.min(valid_fold_aucs):.3f}, {np.max(valid_fold_aucs):.3f}]"
-        )
-    else:
-        log.warning("  No valid per-fold AUCs — all test folds were single-class")
-
-    log.info(f"  Pooled AUC (all test predictions): {overall_auc:.3f}")
-    log.info(f"  Pooled Average Precision:          {overall_ap:.3f}")
 
     mean_coef = coef_accum / n_splits
     coef_df = pd.DataFrame({
@@ -408,14 +352,6 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
             "sign_consistency": sign_consistency,
         }).sort_values("mean_abs_coef", ascending=False).reset_index(drop=True)
         top = sign_df.head(15)
-        log.info("\n  === Sign stability of top 15 features (by mean |coef|) ===")
-        log.info(f"  {'feature':<25} {'mean_signed':>12} {'+folds':>7} {'-folds':>7} {'consistency':>12}")
-        for _, r in top.iterrows():
-            log.info(
-                f"  {r['feature']:<25} {r['mean_signed_coef']:>12.4f} "
-                f"{int(r['n_folds_pos']):>7d} {int(r['n_folds_neg']):>7d} "
-                f"{r['sign_consistency']:>12.2f}"
-            )
 
     results = {
         "fold_aucs":     fold_aucs,
@@ -425,9 +361,11 @@ def leave_donor_out_cv(X, y, groups, classifier_name="logistic", seed=42, min_te
         "n_folds":       n_splits,
         "n_valid_folds": len(valid_fold_aucs),
     }
-    return results, all_y_true, all_y_prob, np.array(all_donors), coef_df, sign_df
 
+    full_model = make_classifier(classifier_name, seed, C=C)
+    full_model.fit(X, y)
 
+    return results, all_y_true, all_y_prob, np.array(all_donors), coef_df, sign_df, full_model
 
 # Plots for visualization of results
 
@@ -467,7 +405,6 @@ def plot_roc_pr(y_true, y_prob, output_dir, prefix="silver"):
     out = Path(output_dir) / f"{prefix}_roc_pr.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    log.info(f"  Saved: {out}")
 
 
 def plot_fold_aucs(fold_aucs, output_dir, prefix="silver"):
@@ -494,7 +431,6 @@ def plot_fold_aucs(fold_aucs, output_dir, prefix="silver"):
     out = Path(output_dir) / f"{prefix}_fold_aucs.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    log.info(f"  Saved: {out}")
 
 
 def plot_top_features(coef_df, n=30, output_dir=".", prefix="silver"):
@@ -519,7 +455,6 @@ def plot_top_features(coef_df, n=30, output_dir=".", prefix="silver"):
     out = Path(output_dir) / f"{prefix}_top_features.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    log.info(f"  Saved: {out}")
 
 
 def plot_prediction_scores(y_true, y_prob, donors, output_dir, prefix="silver"):
@@ -547,8 +482,6 @@ def plot_prediction_scores(y_true, y_prob, donors, output_dir, prefix="silver"):
     out = Path(output_dir) / f"{prefix}_donor_scores.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    log.info(f"  Saved: {out}")
-
 
 def plot_library_sizes(counts: pd.DataFrame, meta: pd.DataFrame,
                        output_dir=".", prefix="silver"):
@@ -567,7 +500,6 @@ def plot_library_sizes(counts: pd.DataFrame, meta: pd.DataFrame,
     out = Path(output_dir) / f"{prefix}_library_sizes.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    log.info(f"  Saved: {out}")
 
 
 def save_results(results, coef_df, all_y_true, all_y_prob, all_donors,
@@ -606,8 +538,6 @@ def save_results(results, coef_df, all_y_true, all_y_prob, all_donors,
         "y_prob": all_y_prob,
     }).to_csv(out / f"{prefix}_predictions.csv", index=False)
 
-    log.info(f"  Saved all results to: {out}/")
-
 
 
 ## Pipeline command ##
@@ -628,34 +558,24 @@ def run_pipeline(
     np.random.seed(seed)
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    log.info("=" * 60)
-    log.info("AD CLASSIFIER PIPELINE")
-    log.info("=" * 60)
-
     #Load data
-    log.info("\n[1/8] Loading data")
     counts  = load_counts(counts_path)
     meta    = load_metadata(meta_path)
     gwas_genes = load_gwas_genes(gwas_csv)
 
     #Align samples
-    log.info("\n[2/8] Aligning samples")
     counts, meta = align_samples(counts, meta)
 
     #QC
-    log.info("\n[3/8] QC — library sizes")
     plot_library_sizes(counts, meta, output_dir, prefix)
 
     #Filter low-count genes 
-    log.info("\n[4/8] Filtering low-count genes")
     counts_filt = filter_low_counts(counts, min_count, min_samples_frac)
 
     #Normalizaation
-    log.info(f"\n[5/8] Normalizing ({norm_method})")
     norm_expr = normalize(counts_filt, meta, method=norm_method)
 
     #GWAS feature selection
-    log.info("\n[6/8] GWAS gene filtering + feature assembly")
     ensembl_map = build_ensembl_to_symbol_map(norm_expr.index)
     gwas_expr   = gwas_filter_expression(norm_expr, gwas_genes, ensembl_map)
     log2fc_genes = log2fc_filter_expression(counts, meta,n_genes=100)
@@ -671,25 +591,17 @@ def run_pipeline(
     groups = meta["donor_id_alias"]          # donor grouping for CV
 
     #classification 
-    log.info(f"\n[7/8] Leave-donor-out CV with '{classifier_name}' classifier")
-    results, y_true, y_prob, donors, coef_df, sign_df = leave_donor_out_cv(
+    results, y_true, y_prob, donors, coef_df, sign_df, full_model = leave_donor_out_cv(
         X, y, groups, classifier_name, seed, C=C
     )
 
     #for saving and plottoing
-    log.info("\n[8/8] Saving results and plots")
-    save_results(results, coef_df, y_true, y_prob, donors, output_dir, prefix,
+    save_results(results, coef_df, y_true, y_prob, donors, output_dir, full_model, prefix,
                  sign_df=sign_df)
     plot_roc_pr(y_true, y_prob, output_dir, prefix)
     plot_fold_aucs(results["fold_aucs"], output_dir, prefix)
     plot_top_features(coef_df, n=min(30, len(coef_df)), output_dir=output_dir, prefix=prefix)
     plot_prediction_scores(y_true, y_prob, donors, output_dir, prefix)
-
-    log.info("\n" + "=" * 60)
-    log.info(f"DONE  |  Pooled AUC = {results['overall_auc']:.3f}  "
-             f"|  AP = {results['overall_ap']:.3f}")
-    log.info(f"Results written to: {output_dir}/")
-    log.info("=" * 60)
 
     return results, coef_df
 
