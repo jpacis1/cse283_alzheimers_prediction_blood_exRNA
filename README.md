@@ -45,7 +45,7 @@ Consists of 115 rows (one per sample) and 10 clinical fields. The primary fields
 Run the pipeline through the following command:
 
 ```
-python ad_classifier_pipeline.py \
+python ad_classifier_pipeline_v2.py \
     --counts   ../silver_seq/silver_seq_counts.txt \
     --metadata ../silver_seq/silver_seq_metadata.xlsx \
     --gwas     ../ad_gwas_hits/AD_GWAS_hits.csv \
