@@ -113,10 +113,6 @@ def align_samples(counts: pd.DataFrame, meta: pd.DataFrame):
 def filter_low_counts(counts: pd.DataFrame,
                       min_count: int = 10,
                       min_samples_frac: float = 0.10) -> pd.DataFrame:
-    """
-    Remove genes where fewer than `min_samples_frac` fraction of samples
-    have >= `min_count` reads. This is the standard edgeR/DESeq2 pre-filter.
-    """
     n_samples = counts.shape[1]
     min_samples = max(1, int(np.ceil(min_samples_frac * n_samples)))
     mask = (counts >= min_count).sum(axis=1) >= min_samples
@@ -132,15 +128,10 @@ def filter_low_counts(counts: pd.DataFrame,
 
 def normalize_cpm_log2(counts: pd.DataFrame,
                        pseudo: float = 1.0) -> pd.DataFrame:
-    """
-    CPM normalisation followed by log2(CPM + pseudo).
-    Simple and effective; pseudo-count avoids log(0).
-    Genes on rows, samples on columns.
-    """
     lib_sizes = counts.sum(axis=0)
     cpm = counts.divide(lib_sizes, axis=1) * 1e6
     log2cpm = np.log2(cpm + pseudo)
-    log.info("  Normalisation: log2(CPM + 1)")
+    log.info("  Normalization: log2(CPM + 1)")
     return log2cpm
 
 
@@ -151,7 +142,7 @@ def normalize_vst(counts: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
         from pydeseq2.default_inference import DefaultInference
         from pydeseq2.ds import DeseqStats
 
-        log.info("  Normalisation: DESeq2 VST (via PyDESeq2)")
+        log.info("  Normalization: DESeq2 VST (via PyDESeq2)")
         # NOTE: PyDESeq2 expects samples on rows
         counts_T = counts.T.copy()
         counts_T.index.name = "sample"
@@ -238,7 +229,7 @@ def gwas_filter_expression(norm_expr: pd.DataFrame,
         log.warning(
             "  No GWAS genes matched expression matrix. "
             "The ENSEMBL→symbol mapping may have failed. "
-            "Using full normalised matrix as fallback (not recommended)."
+            "Using full normalized matrix as fallback (not recommended)."
         )
         return norm_expr
     return norm_expr.loc[selected_rows]
@@ -713,7 +704,7 @@ def parse_args():
     p.add_argument("--output_dir", default="results", help="Directory for outputs")
     p.add_argument("--prefix",    default="silver", help="Filename prefix for all outputs")
     p.add_argument("--norm_method", default="cpm_log2", choices=["cpm_log2", "vst"],
-                   help="Normalisation method")
+                   help="Normalization method")
     p.add_argument("--classifier", default="logistic",
                    choices=["logistic", "elasticnet", "rf","lda"],
                    help="Classifier type")
