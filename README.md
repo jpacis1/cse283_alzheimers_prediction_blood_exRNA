@@ -44,7 +44,6 @@ Consists of 115 rows (one per sample) and 10 clinical fields. The primary fields
 ## AD classifer pipeline
 Run the pipeline through the following command:
 
-(this is a call i ran to make sure the pipeline was working, RESULTS ARE BAD lol but they are in the results section of the pipeline directory)
 ```
 python ad_classifier_pipeline.py \
     --counts   ../silver_seq/silver_seq_counts.txt \
@@ -88,10 +87,8 @@ All outputs are written to the directory specified by `--output_dir` (default is
 ---
 
 ## Conda environment
-I can attach a yml file for my conda environment that I used to run the pipeline, but I made my own conda environment to run this pipeline and installed the necessary packages
-
-Once I made the environment, I think this is all that is needed to be installed to run the classifier pipeline.
 ```
+conda create -n ad_silverseq_env
 mamba install numpy pandas matplotlib seaborn scipy scikit-learn -c conda-forge
 mamba install openpyxl
 ```
