@@ -56,13 +56,13 @@ python ad_classifier_pipeline_v2.py \
 
 ## Pipeline Execution Steps
 
-1. **GWAS Parsing:** Reads your CSV with `header=1` (skipping the table title row), then auto-detects the gene column by searching for "gene" in the header. Multi-gene cells (e.g., `HLA-DRB1/HLA-DRB5` or `MS4A6A/MS4A4E`) are automatically split on `/` and `,`.
-2. **Low-Count Filter:** Removes genes with fewer than 10 reads in at least 10% of samples ($\approx$ 12 samples here). This filters the matrix down from 60,675 to **~22,150 genes** before normalization—a standard practice to eliminate background noise from very sparse genes.
+1. **GWAS Parsing:** Reads CSV with `header=1`.
+2. **Low-Count Filter:** Removes genes with fewer than 10 reads in at least 10% of samples ($\approx$ 12 samples here). This filters the matrix down from 60,675 to **~22,150 genes** before normalization to eliminate background noise from very sparse genes.
 3. **Normalization:** Defaults to $log_2(\text{CPM}+1)$, which is fast and robust. Pass `--norm_method vst` to use `PyDESeq2`'s variance-stabilizing transform instead, which handles the count-mean relationship more effectively but increases processing time.
 4. **ENSEMBL → Symbol Mapping:** Calls the `mygene.info` REST API in batches to translate ENSEMBL IDs to HGNC symbols for matching against GWAS gene names. 
-    * *Note: Requires internet access on the first run. If the API is unavailable, the pipeline falls back to using all expressed genes with a warning. If this happens, it is recommended to pre-map your GWAS ENSEMBL IDs manually and pass them in the gene column instead.*
-5. **Feature Matrix Construction:** Combines normalized GWAS gene expression (columns prefixed with `expr_`) with available clinical covariates: `apoe4_carrier`, `apoe4_dose`, `year_sample`, and `braak_stage`. `sex` and `age` will be picked up automatically if those column names exist in your metadata.
-6. **Leave-Donor-Out Cross-Validation (CV):** Iterates over all 24 donors, holding each out in turn. This is the mathematically correct CV scheme for longitudinal data, as it prevents samples from the same donor from leaking into both train and test sets. Each fold reports AUC and average precision (AP).
+    * *Note: Requires internet access on the first run. *
+5. **Feature Matrix Construction:** Combines normalized GWAS gene expression (columns prefixed with `expr_`) with available clinical covariates: `apoe4_carrier`, `apoe4_dose`, `year_sample`, and `braak_stage`.
+6. **Leave-Donor-Out Cross-Validation (CV):** Iterates over all 24 donors, holding each out in turn. This prevents samples from the same donor from leaking into both train and test sets in longitudinal data. Each fold reports AUC and average precision (AP).
 
 ---
 
